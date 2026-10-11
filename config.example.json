@@ -1,0 +1,22 @@
+{
+  "home_assistant": {
+    "url": "http://homeassistant.local:8123",
+    "token": "PASTE_HOME_ASSISTANT_LONG_LIVED_TOKEN_HERE",
+    "verify_tls": true
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8443,
+    "tls_cert": "cert.pem",
+    "tls_key": "key.pem"
+  },
+  "client_token_hashes": [
+    "PASTE_SHA256_HASH_FROM_gen-token_HERE"
+  ],
+  "allowed_domains": [
+    "sensor", "binary_sensor", "weather", "sun", "climate", "light", "switch",
+    "cover", "fan", "input_boolean", "input_number", "input_select", "input_text",
+    "humidifier", "media_player", "vacuum", "water_heater", "number", "select"
+  ],
+  "max_history_days": 7
+}

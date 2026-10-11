@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+HaFunnel - a read-only, token-protected HTTPS funnel in front of Home Assistant.
+
+Design guarantees
+-----------------
+* Every endpoint requires a client bearer token (checked against SHA-256 hashes).
+* Only GET/HEAD requests are accepted; everything else gets 405.
+* The upstream client (`ha_get`) can only issue HTTP GET to Home Assistant.
+  There is no code path that calls /api/services, POST, PUT or DELETE, so
+  turning things on/off or changing state is impossible by construction.
+* Only entities in allowed domains are visible; entity ids are strictly validated.
+* The server refuses to start without a TLS certificate and key.
+
+Usage
+-----
+    python hafunnel.py gen-token                    # create a client token (+ its hash)
+    python hafunnel.py serve [--config config.json] # run the server
+"""
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import re
+import secrets
+import ssl
+import stat
+import sys
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import httpx
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+log = logging.getLogger("hafunnel")
+
+DEFAULT_ALLOWED_DOMAINS = [
+    "sensor", "binary_sensor", "weather", "sun", "climate", "light", "switch",
+    "cover", "fan", "input_boolean", "input_number", "input_select", "input_text",
+    "humidifier", "media_player", "vacuum", "water_heater", "number", "select",
+]
+# Deliberately NOT in the defaults: camera (entity_picture URLs carry access
+# tokens), lock, alarm_control_panel, person, device_tracker (privacy/security).
+
+# --------------------------------------------------------------------------- #
+# Configuration (loaded from config.json by load_config())
+# --------------------------------------------------------------------------- #
+HA_URL = ""
+HA_TOKEN = ""
+HA_VERIFY_TLS = True
+CLIENT_TOKEN_HASHES: set[str] = set()
+ALLOWED_DOMAINS: set[str] = set(DEFAULT_ALLOWED_DOMAINS)
+BIND_HOST = "0.0.0.0"
+BIND_PORT = 8443
+TLS_CERT = ""
+TLS_KEY = ""
+MAX_HISTORY_DAYS = 7
+
+# Brute-force protection: max failed auth attempts per IP per window.
+MAX_FAILURES = 10
+FAIL_WINDOW_SECONDS = 60
+
+ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config(path: Path) -> None:
+    """Read and validate config.json, populating the module-level settings."""
+    global HA_URL, HA_TOKEN, HA_VERIFY_TLS, CLIENT_TOKEN_HASHES, ALLOWED_DOMAINS
+    global BIND_HOST, BIND_PORT, TLS_CERT, TLS_KEY, MAX_HISTORY_DAYS
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ConfigError(f"Config file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Config file is not valid JSON: {exc}")
+    if not isinstance(raw, dict):
+        raise ConfigError("Config root must be a JSON object")
+
+    # The file holds secrets; warn if other users can read it.
+    try:
+        mode = path.stat().st_mode
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            log.warning("%s is readable by other users; run: chmod 600 %s", path, path)
+    except OSError:
+        pass
+
+    ha = raw.get("home_assistant", {})
+    srv = raw.get("server", {})
+    base = path.resolve().parent  # relative cert paths are relative to the config file
+
+    def resolve(p: str) -> str:
+        return str((base / p).resolve()) if p else ""
+
+    HA_URL = str(ha.get("url", "")).rstrip("/")
+    HA_TOKEN = str(ha.get("token", ""))
+    HA_VERIFY_TLS = bool(ha.get("verify_tls", True))
+
+    BIND_HOST = str(srv.get("host", "0.0.0.0"))
+    BIND_PORT = int(srv.get("port", 8443))
+    TLS_CERT = resolve(str(srv.get("tls_cert", "")))
+    TLS_KEY = resolve(str(srv.get("tls_key", "")))
+
+    hashes = raw.get("client_token_hashes", [])
+    if not isinstance(hashes, list):
+        raise ConfigError("client_token_hashes must be a list")
+    CLIENT_TOKEN_HASHES = {str(h).strip().lower() for h in hashes if str(h).strip()}
+
+    domains = raw.get("allowed_domains", DEFAULT_ALLOWED_DOMAINS)
+    if not isinstance(domains, list):
+        raise ConfigError("allowed_domains must be a list")
+    ALLOWED_DOMAINS = {str(d).strip() for d in domains if str(d).strip()}
+
+    MAX_HISTORY_DAYS = int(raw.get("max_history_days", 7))
+
+    problems = []
+    if not HA_URL.startswith(("http://", "https://")):
+        problems.append("home_assistant.url must start with http:// or https://")
+    if not HA_TOKEN or HA_TOKEN.startswith("PASTE_"):
+        problems.append("home_assistant.token is not set")
+    if not CLIENT_TOKEN_HASHES:
+        problems.append("client_token_hashes is empty (run: hafunnel.py gen-token)")
+    for h in CLIENT_TOKEN_HASHES:
+        if not SHA256_RE.match(h):
+            problems.append(f"client_token_hashes entry is not a SHA-256 hex digest: {h[:12]}...")
+    if not (TLS_CERT and TLS_KEY and Path(TLS_CERT).is_file() and Path(TLS_KEY).is_file()):
+        problems.append("server.tls_cert / server.tls_key must point to existing files")
+    if problems:
+        raise ConfigError("\n  - ".join(["Invalid configuration:"] + problems))
+
+
+# --------------------------------------------------------------------------- #
+# Upstream Home Assistant client -- GET ONLY
+# --------------------------------------------------------------------------- #
+_ha_client: Optional[httpx.AsyncClient] = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _ha_client
+    if _ha_client is None:
+        _ha_client = httpx.AsyncClient(
+            base_url=HA_URL,
+            headers={"Authorization": f"Bearer {HA_TOKEN}"},
+            verify=HA_VERIFY_TLS,
+            timeout=15.0,
+        )
+    return _ha_client
+
+
+async def ha_get(path: str, params: Optional[dict] = None):
+    """The ONLY function that talks to Home Assistant. It only does GET."""
+    try:
+        r = await _client().get(path, params=params)
+    except httpx.HTTPError as exc:
+        log.error("Home Assistant unreachable: %s", exc)
+        raise HTTPException(502, "Home Assistant unreachable")
+    if r.status_code == 404:
+        raise HTTPException(404, "Not found")
+    if r.status_code >= 400:
+        log.error("Home Assistant returned %s for %s", r.status_code, path)
+        raise HTTPException(502, "Upstream error")
+    return r.json()
+
+
+# --------------------------------------------------------------------------- #
+# Authentication
+# --------------------------------------------------------------------------- #
+bearer = HTTPBearer(auto_error=False)
+_failures: dict[str, deque] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _check_throttle(ip: str) -> None:
+    now = time.monotonic()
+    q = _failures[ip]
+    while q and now - q[0] > FAIL_WINDOW_SECONDS:
+        q.popleft()
+    if len(q) >= MAX_FAILURES:
+        raise HTTPException(429, "Too many failed attempts", headers={"Retry-After": str(FAIL_WINDOW_SECONDS)})
+
+
+async def require_token(
+    request: Request,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+) -> None:
+    ip = _client_ip(request)
+    _check_throttle(ip)
+
+    ok = False
+    if creds and creds.scheme.lower() == "bearer" and creds.credentials:
+        digest = hashlib.sha256(creds.credentials.encode()).hexdigest()
+        # Compare against every hash without short-circuiting.
+        for allowed in CLIENT_TOKEN_HASHES:
+            if hmac.compare_digest(digest, allowed):
+                ok = True
+    if not ok:
+        _failures[ip].append(time.monotonic())
+        log.warning("Rejected request from %s", ip)
+        raise HTTPException(401, "Invalid or missing token", headers={"WWW-Authenticate": "Bearer"})
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _domain(entity_id: str) -> str:
+    return entity_id.split(".", 1)[0]
+
+
+def _visible(entity_id: str) -> bool:
+    return _domain(entity_id) in ALLOWED_DOMAINS
+
+
+def _validate_entity(entity_id: str) -> str:
+    if not ENTITY_ID_RE.match(entity_id) or not _visible(entity_id):
+        # Same response for "bad" and "hidden" so existence is not leaked.
+        raise HTTPException(404, "Not found")
+    return entity_id
+
+
+def _parse_time(value: str, name: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, f"{name} must be an ISO 8601 timestamp")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# App
+# --------------------------------------------------------------------------- #
+# Interactive docs are disabled: they would be unauthenticated.
+app = FastAPI(title="HaFunnel", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def read_only_guard(request: Request, call_next):
+    if request.method not in ("GET", "HEAD"):
+        return JSONResponse({"detail": "Read-only API"}, status_code=405, headers={"Allow": "GET, HEAD"})
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Strict-Transport-Security"] = "max-age=63072000"
+    return response
+
+
+@app.get("/v1/states", dependencies=[Depends(require_token)])
+async def list_states(domain: Optional[str] = Query(None, pattern=r"^[a-z0-9_]+$")):
+    """All visible entity states, optionally filtered by domain."""
+    states = await ha_get("/api/states")
+    out = [s for s in states if _visible(s["entity_id"])]
+    if domain:
+        out = [s for s in out if _domain(s["entity_id"]) == domain]
+    return out
+
+
+@app.get("/v1/states/{entity_id}", dependencies=[Depends(require_token)])
+async def get_state(entity_id: str):
+    """State of one entity."""
+    _validate_entity(entity_id)
+    return await ha_get(f"/api/states/{entity_id}")
+
+
+@app.get("/v1/history/{entity_id}", dependencies=[Depends(require_token)])
+async def get_history(
+    entity_id: str,
+    start: Optional[str] = Query(None, description="ISO 8601, default: 24h ago"),
+    end: Optional[str] = Query(None, description="ISO 8601, default: now"),
+    minimal: bool = True,
+):
+    """State history of one entity (max range is set by max_history_days)."""
+    _validate_entity(entity_id)
+    now = datetime.now(timezone.utc)
+    end_dt = _parse_time(end, "end") if end else now
+    start_dt = _parse_time(start, "start") if start else end_dt - timedelta(hours=24)
+    if start_dt >= end_dt:
+        raise HTTPException(400, "start must be before end")
+    if end_dt - start_dt > timedelta(days=MAX_HISTORY_DAYS):
+        raise HTTPException(400, f"Range may not exceed {MAX_HISTORY_DAYS} days")
+
+    params = {"filter_entity_id": entity_id, "end_time": end_dt.isoformat()}
+    if minimal:
+        params["minimal_response"] = "1"
+        params["no_attributes"] = "1"
+    data = await ha_get(f"/api/history/period/{start_dt.isoformat()}", params)
+    return data[0] if data else []
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def gen_token() -> None:
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    print(f"Client token (give to the client, shown once): {token}")
+    print(f'Add this to "client_token_hashes" in config.json: "{digest}"')
+
+
+def serve(config_path: Path) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    uvicorn.run(
+        app,
+        host=BIND_HOST,
+        port=BIND_PORT,
+        ssl_certfile=TLS_CERT,
+        ssl_keyfile=TLS_KEY,
+        ssl_version=ssl.PROTOCOL_TLS_SERVER,
+        server_header=False,
+        proxy_headers=False,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="HaFunnel: read-only HTTPS API for Home Assistant")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("gen-token", help="generate a client token and its hash")
+    p_serve = sub.add_parser("serve", help="run the server (default)")
+    p_serve.add_argument("--config", "-c", default="config.json", help="path to config.json")
+    args = parser.parse_args()
+
+    if args.cmd == "gen-token":
+        gen_token()
+    else:
+        serve(Path(getattr(args, "config", "config.json")))
+
+
+if __name__ == "__main__":
+    main()
