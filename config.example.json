@@ -19,6 +19,17 @@
     "humidifier", "media_player", "vacuum", "water_heater", "number", "select"
   ],
   "max_history_days": 7,
+  "alerts": {
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "smtp_security": "starttls",
+    "smtp_username": "hafunnel@example.com",
+    "smtp_password": "PASTE_SMTP_PASSWORD_HERE",
+    "from": "hafunnel@example.com",
+    "to": ["you@example.com"],
+    "max_emails_per_hour": 10,
+    "subject_prefix": "[HaFunnel]"
+  },
   "access_gate": {
     "alarm_url": "http://alarm.local/status",
     "state_key": "alarm_state",

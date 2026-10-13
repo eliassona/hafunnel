@@ -11,6 +11,7 @@ Design guarantees
   turning things on/off or changing state is impossible by construction.
 * Only entities in allowed domains are visible; entity ids are strictly validated.
 * The server refuses to start without a TLS certificate and key.
+* Optional e-mail alert whenever someone attempts a non-GET request.
 * Optional access gate: requests are only served outside the night window AND
   while the alarm reports DISARMED (fails closed if the alarm cannot be read).
 
@@ -20,12 +21,15 @@ Usage
     python hafunnel.py serve [--config config.json] # run the server
 """
 import argparse
+import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
 import secrets
+import smtplib
 import ssl
 import stat
 import sys
@@ -33,6 +37,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -77,6 +82,18 @@ GATE_NIGHT_END: Optional[dt_time] = None
 GATE_TZ: Optional[ZoneInfo] = None
 GATE_TIMEOUT = 5.0
 
+# E-mail alerts for write attempts (optional, "alerts" section)
+ALERT_ENABLED = False
+ALERT_HOST = ""
+ALERT_PORT = 587
+ALERT_SECURITY = "starttls"  # starttls | ssl | none
+ALERT_USER = ""
+ALERT_PASSWORD = ""
+ALERT_FROM = ""
+ALERT_TO: list[str] = []
+ALERT_MAX_PER_HOUR = 10
+ALERT_PREFIX = "[HaFunnel]"
+
 # Brute-force protection: max failed auth attempts per IP per window.
 MAX_FAILURES = 10
 FAIL_WINDOW_SECONDS = 60
@@ -95,6 +112,8 @@ def load_config(path: Path) -> None:
     global BIND_HOST, BIND_PORT, TLS_CERT, TLS_KEY, MAX_HISTORY_DAYS
     global GATE_ENABLED, GATE_ALARM_URL, GATE_STATE_KEY, GATE_DISARMED_VALUE
     global GATE_NIGHT_START, GATE_NIGHT_END, GATE_TZ, GATE_TIMEOUT
+    global ALERT_ENABLED, ALERT_HOST, ALERT_PORT, ALERT_SECURITY, ALERT_USER
+    global ALERT_PASSWORD, ALERT_FROM, ALERT_TO, ALERT_MAX_PER_HOUR, ALERT_PREFIX
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -169,6 +188,38 @@ def load_config(path: Path) -> None:
             except ZoneInfoNotFoundError:
                 problems.append(f"access_gate.timezone is not a valid IANA timezone: {tzname}")
             GATE_ENABLED = True
+
+    # Optional e-mail alerts. Remove the "alerts" section to disable them.
+    ALERT_ENABLED = False
+    alerts = raw.get("alerts")
+    if alerts is not None:
+        if not isinstance(alerts, dict):
+            problems.append("alerts must be an object")
+        else:
+            ALERT_HOST = str(alerts.get("smtp_host", ""))
+            ALERT_PORT = int(alerts.get("smtp_port", 587))
+            ALERT_SECURITY = str(alerts.get("smtp_security", "starttls")).lower()
+            ALERT_USER = str(alerts.get("smtp_username", ""))
+            ALERT_PASSWORD = str(alerts.get("smtp_password", ""))
+            ALERT_FROM = str(alerts.get("from", ""))
+            to = alerts.get("to", [])
+            ALERT_TO = [str(t).strip() for t in to if str(t).strip()] if isinstance(to, list) else []
+            ALERT_MAX_PER_HOUR = int(alerts.get("max_emails_per_hour", 10))
+            ALERT_PREFIX = str(alerts.get("subject_prefix", "[HaFunnel]"))
+            if not ALERT_HOST:
+                problems.append("alerts.smtp_host is required")
+            if not ALERT_FROM:
+                problems.append("alerts.from is required")
+            if not ALERT_TO:
+                problems.append("alerts.to must be a non-empty list of e-mail addresses")
+            if ALERT_SECURITY not in ("starttls", "ssl", "none"):
+                problems.append('alerts.smtp_security must be "starttls", "ssl" or "none"')
+            if ALERT_USER and ALERT_SECURITY == "none":
+                problems.append("alerts: refusing to send SMTP credentials without TLS "
+                                '(set smtp_security to "starttls" or "ssl")')
+            if ALERT_MAX_PER_HOUR < 1:
+                problems.append("alerts.max_emails_per_hour must be at least 1")
+            ALERT_ENABLED = True
     if not HA_URL.startswith(("http://", "https://")):
         problems.append("home_assistant.url must start with http:// or https://")
     if not HA_TOKEN or HA_TOKEN.startswith("PASTE_"):
@@ -228,6 +279,17 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _token_is_valid(token: str) -> bool:
+    if not token:
+        return False
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    ok = False
+    for allowed in CLIENT_TOKEN_HASHES:  # compare against every hash, no short-circuit
+        if hmac.compare_digest(digest, allowed):
+            ok = True
+    return ok
+
+
 def _check_throttle(ip: str) -> None:
     now = time.monotonic()
     q = _failures[ip]
@@ -244,13 +306,7 @@ async def require_token(
     ip = _client_ip(request)
     _check_throttle(ip)
 
-    ok = False
-    if creds and creds.scheme.lower() == "bearer" and creds.credentials:
-        digest = hashlib.sha256(creds.credentials.encode()).hexdigest()
-        # Compare against every hash without short-circuiting.
-        for allowed in CLIENT_TOKEN_HASHES:
-            if hmac.compare_digest(digest, allowed):
-                ok = True
+    ok = bool(creds and creds.scheme.lower() == "bearer" and _token_is_valid(creds.credentials))
     if not ok:
         _failures[ip].append(time.monotonic())
         log.warning("Rejected request from %s", ip)
@@ -299,6 +355,101 @@ async def require_access(_: None = Depends(require_token)) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# E-mail alerts for write attempts
+# --------------------------------------------------------------------------- #
+_alert_times: deque = deque()
+_alert_suppressed = 0
+_background_tasks: set = set()
+
+
+def _clean(value: str, limit: int = 300) -> str:
+    """Escape control/non-ASCII characters and truncate (request data is attacker-controlled)."""
+    return value.encode("unicode_escape").decode("ascii")[:limit]
+
+
+def _source_ip(request: Request) -> tuple[str, str]:
+    """Return (best-guess client IP, how it was determined).
+
+    Behind a local reverse proxy (e.g. Tailscale Funnel) the TCP peer is
+    127.0.0.1, so the proxy's X-Forwarded-For is used when the peer is loopback.
+    The LAST entry is taken, because that is the one the nearest proxy added.
+    """
+    peer = request.client.host if request.client else "unknown"
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff and peer in ("127.0.0.1", "::1"):
+        candidate = xff.split(",")[-1].strip()
+        try:
+            return str(ipaddress.ip_address(candidate)), "X-Forwarded-For"
+        except ValueError:
+            pass
+    return peer, "direct connection"
+
+
+def _send_email(subject: str, body: str) -> None:
+    """Blocking SMTP send; run in a worker thread. Never raises."""
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = ALERT_FROM
+        msg["To"] = ", ".join(ALERT_TO)
+        msg.set_content(body)
+        ctx = ssl.create_default_context()
+        if ALERT_SECURITY == "ssl":
+            smtp = smtplib.SMTP_SSL(ALERT_HOST, ALERT_PORT, timeout=10, context=ctx)
+        else:
+            smtp = smtplib.SMTP(ALERT_HOST, ALERT_PORT, timeout=10)
+        with smtp:
+            if ALERT_SECURITY == "starttls":
+                smtp.starttls(context=ctx)
+            if ALERT_USER:
+                smtp.login(ALERT_USER, ALERT_PASSWORD)
+            smtp.send_message(msg)
+        log.info("Alert e-mail sent to %s", ", ".join(ALERT_TO))
+    except (OSError, smtplib.SMTPException, ValueError) as exc:
+        log.error("Failed to send alert e-mail: %s", exc)
+
+
+def notify_write_attempt(request: Request) -> None:
+    """Queue an alert e-mail for a non-GET request (rate limited, non-blocking)."""
+    global _alert_suppressed
+    if not ALERT_ENABLED:
+        return
+    now = time.monotonic()
+    while _alert_times and now - _alert_times[0] > 3600:
+        _alert_times.popleft()
+    if len(_alert_times) >= ALERT_MAX_PER_HOUR:
+        _alert_suppressed += 1
+        return
+    suppressed, _alert_suppressed = _alert_suppressed, 0
+    _alert_times.append(now)
+
+    ip, how = _source_ip(request)
+    peer = request.client.host if request.client else "unknown"
+    auth = request.headers.get("authorization", "")
+    scheme, _, cred = auth.partition(" ")
+    token_valid = scheme.lower() == "bearer" and _token_is_valid(cred.strip())
+
+    subject = f"{ALERT_PREFIX} Blocked {_clean(request.method, 12)} request from {ip}"
+    lines = [
+        "A write request was attempted against HaFunnel and was blocked (the API is read-only).",
+        "",
+        f"Time (UTC):       {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        f"Method:           {_clean(request.method, 12)}",
+        f"URL:              {_clean(str(request.url), 500)}",
+        f"Source IP:        {ip}  (from {how})",
+        f"Direct peer:      {peer}",
+        f"X-Forwarded-For:  {_clean(request.headers.get('x-forwarded-for', '-'), 200)}",
+        f"User-Agent:       {_clean(request.headers.get('user-agent', '-'), 200)}",
+        f"Valid API token:  {'YES' if token_valid else 'no'}",
+    ]
+    if suppressed:
+        lines += ["", f"{suppressed} further alert(s) were suppressed by the hourly limit since the last e-mail."]
+    task = asyncio.create_task(asyncio.to_thread(_send_email, subject, "\n".join(lines) + "\n"))
+    _background_tasks.add(task)  # keep a reference until it finishes
+    task.add_done_callback(_background_tasks.discard)
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _domain(entity_id: str) -> str:
@@ -336,6 +487,7 @@ app = FastAPI(title="HaFunnel", docs_url=None, redoc_url=None, openapi_url=None)
 @app.middleware("http")
 async def read_only_guard(request: Request, call_next):
     if request.method not in ("GET", "HEAD"):
+        notify_write_attempt(request)
         return JSONResponse({"detail": "Read-only API"}, status_code=405, headers={"Allow": "GET, HEAD"})
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"

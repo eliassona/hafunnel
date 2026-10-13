@@ -54,6 +54,27 @@ Run every command below with `./venv/bin/python` (or run `source venv/bin/activa
 | `allowed_domains` | see `config.example.json` | Visible entity domains |
 | `max_history_days` | `7` | Max history range |
 
+### E-mail alerts for write attempts (optional)
+
+Whenever someone sends anything other than GET/HEAD (POST, PUT, DELETE, ...), the request is refused with `405` and an e-mail is sent to the configured recipients with the **method, full URL, source IP**, user agent, and whether a valid API token was presented. Remove the `alerts` section to disable it.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `alerts.smtp_host` / `smtp_port` | required / `587` | Mail server |
+| `alerts.smtp_security` | `starttls` | `starttls`, `ssl` (port 465) or `none` |
+| `alerts.smtp_username` / `smtp_password` | empty | SMTP login (refused when `smtp_security` is `none`) |
+| `alerts.from` | required | Sender address |
+| `alerts.to` | required | List of recipient addresses |
+| `alerts.max_emails_per_hour` | `10` | Flood protection; extra alerts are counted and reported in the next e-mail |
+| `alerts.subject_prefix` | `[HaFunnel]` | Prefix for the subject line |
+
+Notes:
+* Mail is sent in the background, so a slow or broken mail server never delays or breaks the API response. Failures are logged (`journalctl -u hafunnel`).
+* Alerts are sent for **any** non-GET request, with or without a token. Public scanners will trigger them, which is what the hourly limit is for. "Valid API token: YES" in an alert means someone holding a real token tried to write.
+* **Source IP behind Tailscale Funnel:** the TCP peer is then `127.0.0.1`, so HaFunnel uses the last entry of the `X-Forwarded-For` header when the peer is loopback. Both the derived IP and the raw header are included in the e-mail, so you can verify it. Send a test POST from outside and check that your real public IP appears.
+* Request data in the e-mail (URL, headers) is escaped and truncated, since it is attacker-controlled.
+* Gmail and similar services need an app password, not your normal password.
+
 ### Access gate (optional)
 
 Restricts access by time of day and alarm state. A request is **allowed only when it is outside the night window AND the alarm is `DISARMED`**. It is denied if it is night, or if the alarm is in any other state. Remove the `access_gate` section to turn the gate off.
