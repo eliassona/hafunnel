@@ -18,5 +18,14 @@
     "cover", "fan", "input_boolean", "input_number", "input_select", "input_text",
     "humidifier", "media_player", "vacuum", "water_heater", "number", "select"
   ],
-  "max_history_days": 7
+  "max_history_days": 7,
+  "access_gate": {
+    "alarm_url": "http://alarm.local/status",
+    "state_key": "alarm_state",
+    "disarmed_value": "DISARMED",
+    "night_start": "23:00",
+    "night_end": "06:00",
+    "timezone": "Europe/Stockholm",
+    "timeout_seconds": 5
+  }
 }

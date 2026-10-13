@@ -4,9 +4,14 @@ A read-only, token-protected HTTPS REST API in front of Home Assistant.
 
 ## Install
 
+Use a virtual environment (required on Raspberry Pi OS / Debian 12+, where system-wide `pip install` is blocked):
+
 ```bash
-pip install "fastapi>=0.110" "uvicorn>=0.29" "httpx>=0.27"
+python3 -m venv venv        # if this fails: sudo apt install python3-venv
+./venv/bin/pip install "fastapi>=0.110" "uvicorn>=0.29" "httpx>=0.27"
 ```
+
+Run every command below with `./venv/bin/python` (or run `source venv/bin/activate` once and use `python`).
 
 ## Setup
 
@@ -20,8 +25,10 @@ pip install "fastapi>=0.110" "uvicorn>=0.29" "httpx>=0.27"
 3. **TLS certificate** (self-signed example; use a real cert/Let's Encrypt if exposed publicly):
    ```bash
    openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
-     -keyout key.pem -out cert.pem -subj "/CN=hafunnel.local"
+     -keyout key.pem -out cert.pem -subj "/CN=hafunnel" \
+     -addext "subjectAltName=DNS:localhost,DNS:hafunnel.local,IP:127.0.0.1"
    ```
+   Clients verify the hostname against the SANs, so list every name or IP they will connect to.
 4. **Config**:
    ```bash
    cp config.example.json config.json
@@ -46,6 +53,27 @@ pip install "fastapi>=0.110" "uvicorn>=0.29" "httpx>=0.27"
 | `client_token_hashes` | required | List of SHA-256 hashes of accepted client tokens |
 | `allowed_domains` | see `config.example.json` | Visible entity domains |
 | `max_history_days` | `7` | Max history range |
+
+### Access gate (optional)
+
+Restricts access by time of day and alarm state. A request is **allowed only when it is outside the night window AND the alarm is `DISARMED`**. It is denied if it is night, or if the alarm is in any other state. Remove the `access_gate` section to turn the gate off.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `access_gate.alarm_url` | required | Plain HTTP(S) URL that returns JSON such as `{"alarm_state": "DISARMED"}` |
+| `access_gate.state_key` | `alarm_state` | JSON field holding the state |
+| `access_gate.disarmed_value` | `DISARMED` | Value that counts as disarmed (case-insensitive) |
+| `access_gate.night_start` / `night_end` | required | `"HH:MM"` 24h. Start is inclusive, end exclusive. Windows crossing midnight work (`23:00`-`06:00`) |
+| `access_gate.timezone` | server local time | IANA name, e.g. `Europe/Stockholm`. Set it, since a Pi is often on UTC |
+| `access_gate.timeout_seconds` | `5` | Timeout for the alarm query |
+
+Behaviour:
+* The token is checked first; the gate only applies to requests with a valid token.
+* During the night window every request is denied (`403`) and the alarm is not queried.
+* Outside the night window the alarm is queried on each request; anything other than the disarmed value gives `403`.
+* **Fails closed:** if the alarm URL is unreachable, times out or returns something unexpected, the API returns `503` instead of serving data.
+* The response never reveals the alarm state.
+* The Home Assistant token is never sent to the alarm URL.
 
 The server validates the config at startup and exits with a clear message if anything is missing or invalid. It also warns if `config.json` is readable by other users.
 

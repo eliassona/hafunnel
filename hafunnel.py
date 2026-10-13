@@ -11,6 +11,8 @@ Design guarantees
   turning things on/off or changing state is impossible by construction.
 * Only entities in allowed domains are visible; entity ids are strictly validated.
 * The server refuses to start without a TLS certificate and key.
+* Optional access gate: requests are only served outside the night window AND
+  while the alarm reports DISARMED (fails closed if the alarm cannot be read).
 
 Usage
 -----
@@ -30,8 +32,10 @@ import sys
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import uvicorn
@@ -63,6 +67,16 @@ TLS_CERT = ""
 TLS_KEY = ""
 MAX_HISTORY_DAYS = 7
 
+# Access gate (optional, configured by the "access_gate" section)
+GATE_ENABLED = False
+GATE_ALARM_URL = ""
+GATE_STATE_KEY = "alarm_state"
+GATE_DISARMED_VALUE = "DISARMED"
+GATE_NIGHT_START: Optional[dt_time] = None
+GATE_NIGHT_END: Optional[dt_time] = None
+GATE_TZ: Optional[ZoneInfo] = None
+GATE_TIMEOUT = 5.0
+
 # Brute-force protection: max failed auth attempts per IP per window.
 MAX_FAILURES = 10
 FAIL_WINDOW_SECONDS = 60
@@ -79,6 +93,8 @@ def load_config(path: Path) -> None:
     """Read and validate config.json, populating the module-level settings."""
     global HA_URL, HA_TOKEN, HA_VERIFY_TLS, CLIENT_TOKEN_HASHES, ALLOWED_DOMAINS
     global BIND_HOST, BIND_PORT, TLS_CERT, TLS_KEY, MAX_HISTORY_DAYS
+    global GATE_ENABLED, GATE_ALARM_URL, GATE_STATE_KEY, GATE_DISARMED_VALUE
+    global GATE_NIGHT_START, GATE_NIGHT_END, GATE_TZ, GATE_TIMEOUT
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -126,6 +142,33 @@ def load_config(path: Path) -> None:
     MAX_HISTORY_DAYS = int(raw.get("max_history_days", 7))
 
     problems = []
+
+    # Optional access gate. Remove the "access_gate" section to disable it.
+    GATE_ENABLED = False
+    gate = raw.get("access_gate")
+    if gate is not None:
+        if not isinstance(gate, dict):
+            problems.append("access_gate must be an object")
+        else:
+            GATE_ALARM_URL = str(gate.get("alarm_url", ""))
+            GATE_STATE_KEY = str(gate.get("state_key", "alarm_state"))
+            GATE_DISARMED_VALUE = str(gate.get("disarmed_value", "DISARMED"))
+            GATE_TIMEOUT = float(gate.get("timeout_seconds", 5))
+            if not GATE_ALARM_URL.startswith(("http://", "https://")):
+                problems.append("access_gate.alarm_url must start with http:// or https://")
+            try:
+                GATE_NIGHT_START = datetime.strptime(str(gate.get("night_start", "")), "%H:%M").time()
+                GATE_NIGHT_END = datetime.strptime(str(gate.get("night_end", "")), "%H:%M").time()
+                if GATE_NIGHT_START == GATE_NIGHT_END:
+                    problems.append("access_gate.night_start and night_end must differ")
+            except ValueError:
+                problems.append('access_gate.night_start / night_end must be "HH:MM" (24h)')
+            tzname = gate.get("timezone")
+            try:
+                GATE_TZ = ZoneInfo(str(tzname)) if tzname else None  # None = server local time
+            except ZoneInfoNotFoundError:
+                problems.append(f"access_gate.timezone is not a valid IANA timezone: {tzname}")
+            GATE_ENABLED = True
     if not HA_URL.startswith(("http://", "https://")):
         problems.append("home_assistant.url must start with http:// or https://")
     if not HA_TOKEN or HA_TOKEN.startswith("PASTE_"):
@@ -215,6 +258,47 @@ async def require_token(
 
 
 # --------------------------------------------------------------------------- #
+# Access gate: allowed only when it is NOT night AND the alarm is DISARMED
+# --------------------------------------------------------------------------- #
+def _in_night(t: dt_time) -> bool:
+    """True if t is inside the night window [start, end). Handles windows crossing midnight."""
+    start, end = GATE_NIGHT_START, GATE_NIGHT_END
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end
+
+
+async def _alarm_is_disarmed() -> bool:
+    """Ask the alarm's HTTP endpoint. Any failure raises 503 (fail closed).
+
+    Uses its own client so the Home Assistant token is never sent to this URL.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=GATE_TIMEOUT) as c:
+            r = await c.get(GATE_ALARM_URL)
+        r.raise_for_status()
+        state = r.json()[GATE_STATE_KEY]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        log.error("Alarm status check failed: %s", exc)
+        raise HTTPException(503, "Access check unavailable")
+    return isinstance(state, str) and state.strip().upper() == GATE_DISARMED_VALUE.upper()
+
+
+async def require_access(_: None = Depends(require_token)) -> None:
+    """Token check first, then the gate: allowed only outside the night window
+    AND while the alarm is DISARMED. Anything else is denied."""
+    if not GATE_ENABLED:
+        return
+    if _in_night(datetime.now(GATE_TZ).time()):
+        log.info("Request denied: inside night window")
+        raise HTTPException(403, "Access not allowed right now")
+    if await _alarm_is_disarmed():
+        return
+    log.info("Request denied: alarm not disarmed")
+    raise HTTPException(403, "Access not allowed right now")
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _domain(entity_id: str) -> str:
@@ -260,7 +344,7 @@ async def read_only_guard(request: Request, call_next):
     return response
 
 
-@app.get("/v1/states", dependencies=[Depends(require_token)])
+@app.get("/v1/states", dependencies=[Depends(require_access)])
 async def list_states(domain: Optional[str] = Query(None, pattern=r"^[a-z0-9_]+$")):
     """All visible entity states, optionally filtered by domain."""
     states = await ha_get("/api/states")
@@ -270,14 +354,14 @@ async def list_states(domain: Optional[str] = Query(None, pattern=r"^[a-z0-9_]+$
     return out
 
 
-@app.get("/v1/states/{entity_id}", dependencies=[Depends(require_token)])
+@app.get("/v1/states/{entity_id}", dependencies=[Depends(require_access)])
 async def get_state(entity_id: str):
     """State of one entity."""
     _validate_entity(entity_id)
     return await ha_get(f"/api/states/{entity_id}")
 
 
-@app.get("/v1/history/{entity_id}", dependencies=[Depends(require_token)])
+@app.get("/v1/history/{entity_id}", dependencies=[Depends(require_access)])
 async def get_history(
     entity_id: str,
     start: Optional[str] = Query(None, description="ISO 8601, default: 24h ago"),
