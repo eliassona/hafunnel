@@ -1,6 +1,7 @@
 # HaFunnel
 
-A read-only, token-protected HTTPS REST API in front of Home Assistant.
+A token-protected HTTPS REST API in front of Home Assistant.
+Reads are open for allow-listed domains; writes are limited by construction to the regular oven only.
 
 ## Install
 
@@ -105,19 +106,105 @@ The server validates the config at startup and exits with a clear message if any
 | GET | `/v1/states[?domain=sensor]` | All visible entity states |
 | GET | `/v1/states/{entity_id}` | One entity's state |
 | GET | `/v1/history/{entity_id}?start=&end=&minimal=true` | History (ISO 8601 times, default last 24h) |
+| POST | `/v1/oven` | Control the **regular oven only** (see below) |
 
 ```bash
 curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
   https://localhost:8443/v1/states/sensor.living_room_temperature
 ```
 
-## Why it can't change anything
+### Oven control (`POST /v1/oven`)
 
-* Routes are GET-only; a middleware answers 405 to any other HTTP method.
-* The sole upstream function, `ha_get`, only performs GET against Home Assistant.
-  Nothing calls `/api/services/...`, so no service (turn on/off, etc.) can be invoked.
-* Entity domains are allowlisted; cameras, locks, alarm panels, persons and device
-  trackers are hidden unless you add them.
+Writes are restricted by construction to these five entities of the regular oven
+(not the microwave oven, dishwasher or induction cooktop):
+
+| entity_id | allowed services | extra body fields |
+|---|---|---|
+| `switch.oven_power` | `turn_on`, `turn_off`, `toggle` | — |
+| `switch.oven_child_lock` | `turn_on`, `turn_off` | — |
+| `select.oven_selected_programme` | `select_option` | `"option": "<programme key>"` |
+| `select.oven_active_programme` | `select_option` | `"option": "<programme key>"` |
+| `number.oven_alarm_clock` | `set_value` | `"value": <seconds>` |
+
+Any other `entity_id`, domain or service is rejected with `400`. Any other path
+or HTTP method that would write is rejected with `405` and (if configured)
+triggers an alert e-mail.
+
+**Examples** (replace host/cert/token as needed):
+
+```bash
+# Turn oven power on
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"switch.oven_power","service":"turn_on"}' \
+  https://localhost:8443/v1/oven
+
+# Turn oven power off
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"switch.oven_power","service":"turn_off"}' \
+  https://localhost:8443/v1/oven
+
+# Select a programme (queues it; does not always start it)
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"select.oven_selected_programme","service":"select_option","option":"cooking_oven_program_heating_mode_hot_air"}' \
+  https://localhost:8443/v1/oven
+
+# Start / set active programme (when remote start is allowed on the appliance)
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"select.oven_active_programme","service":"select_option","option":"cooking_oven_program_heating_mode_hot_air"}' \
+  https://localhost:8443/v1/oven
+
+# Child lock on
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"switch.oven_child_lock","service":"turn_on"}' \
+  https://localhost:8443/v1/oven
+
+# Alarm clock = 5 minutes
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entity_id":"number.oven_alarm_clock","service":"set_value","value":300}' \
+  https://localhost:8443/v1/oven
+```
+
+Programme keys currently exposed by the oven (from `select.oven_*_programme`
+options):  
+`cooking_oven_program_heating_mode_slow_cook`,  
+`cooking_oven_program_heating_mode_hot_air_eco`,  
+`cooking_oven_program_heating_mode_hot_air`,  
+`cooking_oven_program_heating_mode_hot_air_grilling`,  
+`cooking_oven_program_heating_mode_top_bottom_heating`,  
+`cooking_oven_program_heating_mode_pizza_setting`,  
+`cooking_oven_program_heating_mode_top_bottom_heating_eco`,  
+`cooking_oven_program_heating_mode_preheat_ovenware`,  
+`cooking_oven_program_heating_mode_sabbath_programme`,  
+`cooking_oven_program_heating_mode_keep_warm`,  
+`cooking_oven_program_heating_mode_bottom_heating`,  
+`cooking_oven_program_steam_modes_steam`.
+
+Notes for real use:
+
+* `binary_sensor.oven_remote_control` must be `on` and, for starting a programme,
+  `binary_sensor.oven_remote_start` is often required to be `on` (set on the
+  appliance itself).
+* Selecting `select.oven_active_programme` typically starts the programme when
+  the appliance allows remote start; `select.oven_selected_programme` only
+  queues it.
+* Temperature / duration options for a running programme are not exposed as
+  simple entities in the state dump you shared; they would need the Home Connect
+  `set_program_and_options` service (device_id based), which is intentionally
+  not opened here.
+
+## What can still not be changed
+
+* Middleware allows POST only to `/v1/oven`. Every other non-GET method returns 405.
+* The write path hard-codes the five oven entity_ids and the three service domains
+  above; there is no way to reach `/api/services` for any other entity.
+* Entity domains for reads are still allowlisted; cameras, locks, alarm panels,
+  persons and device trackers stay hidden unless you add them.
 * Entity IDs are regex-validated, so clients cannot inject paths into upstream calls.
 
 ## Notes

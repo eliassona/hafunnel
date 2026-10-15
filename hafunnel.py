@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-HaFunnel - a read-only, token-protected HTTPS funnel in front of Home Assistant.
+HaFunnel - a token-protected HTTPS funnel in front of Home Assistant.
 
 Design guarantees
 -----------------
 * Every endpoint requires a client bearer token (checked against SHA-256 hashes).
-* Only GET/HEAD requests are accepted; everything else gets 405.
-* The upstream client (`ha_get`) can only issue HTTP GET to Home Assistant.
-  There is no code path that calls /api/services, POST, PUT or DELETE, so
-  turning things on/off or changing state is impossible by construction.
+* Read endpoints are GET/HEAD only.
+* Writes are limited by construction to the regular oven only
+  (switch.oven_*, select.oven_*, number.oven_*). No other entity or service
+  can be written. The upstream client never receives an unconstrained POST.
 * Only entities in allowed domains are visible; entity ids are strictly validated.
 * The server refuses to start without a TLS certificate and key.
-* Optional e-mail alert whenever someone attempts a non-GET request.
+* Optional e-mail alert whenever someone attempts a disallowed write method/path.
 * Optional access gate: requests are only served outside the night window AND
   while the alarm reports DISARMED (fails closed if the alarm cannot be read).
 
@@ -236,9 +236,29 @@ def load_config(path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Upstream Home Assistant client -- GET ONLY
+# Upstream Home Assistant client
+# --------------------------------------------------------------------------- #
+# ha_get is unrestricted (subject to domain filter on the way out).
+# ha_post is only callable for oven write paths; the allow-list is enforced
+# before any request leaves this process.
 # --------------------------------------------------------------------------- #
 _ha_client: Optional[httpx.AsyncClient] = None
+
+# Regular oven only (not microwave_oven / dishwasher / induction_cooktop).
+OVEN_WRITE_ENTITIES = frozenset({
+    "switch.oven_power",
+    "switch.oven_child_lock",
+    "select.oven_selected_programme",
+    "select.oven_active_programme",
+    "number.oven_alarm_clock",
+})
+
+# domain -> set of services we will proxy for the oven entities above.
+OVEN_WRITE_SERVICES = {
+    "switch": frozenset({"turn_on", "turn_off", "toggle"}),
+    "select": frozenset({"select_option"}),
+    "number": frozenset({"set_value"}),
+}
 
 
 def _client() -> httpx.AsyncClient:
@@ -254,7 +274,7 @@ def _client() -> httpx.AsyncClient:
 
 
 async def ha_get(path: str, params: Optional[dict] = None):
-    """The ONLY function that talks to Home Assistant. It only does GET."""
+    """GET against Home Assistant."""
     try:
         r = await _client().get(path, params=params)
     except httpx.HTTPError as exc:
@@ -266,6 +286,35 @@ async def ha_get(path: str, params: Optional[dict] = None):
         log.error("Home Assistant returned %s for %s", r.status_code, path)
         raise HTTPException(502, "Upstream error")
     return r.json()
+
+
+async def ha_post(path: str, body: dict):
+    """POST against Home Assistant. Caller must already have enforced the oven allow-list."""
+    try:
+        r = await _client().post(path, json=body)
+    except httpx.HTTPError as exc:
+        log.error("Home Assistant unreachable: %s", exc)
+        raise HTTPException(502, "Home Assistant unreachable")
+    if r.status_code == 404:
+        raise HTTPException(404, "Not found")
+    if r.status_code >= 400:
+        # Surface HA's message when present; still do not leak arbitrary upstream bodies.
+        detail = "Upstream error"
+        try:
+            j = r.json()
+            if isinstance(j, dict) and j.get("message"):
+                detail = str(j["message"])[:200]
+        except Exception:
+            pass
+        log.error("Home Assistant returned %s for %s: %s", r.status_code, path, detail)
+        raise HTTPException(502, detail)
+    # Many HA service calls return 200 with empty body.
+    if not r.content:
+        return {"ok": True}
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -431,7 +480,8 @@ def notify_write_attempt(request: Request) -> None:
 
     subject = f"{ALERT_PREFIX} Blocked {_clean(request.method, 12)} request from {ip}"
     lines = [
-        "A write request was attempted against HaFunnel and was blocked (the API is read-only).",
+        "A disallowed write request was attempted against HaFunnel and was blocked.",
+        "Only POST /v1/oven (regular oven entities) is permitted for writes.",
         "",
         f"Time (UTC):       {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         f"Method:           {_clean(request.method, 12)}",
@@ -485,10 +535,21 @@ app = FastAPI(title="HaFunnel", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 @app.middleware("http")
-async def read_only_guard(request: Request, call_next):
-    if request.method not in ("GET", "HEAD"):
+async def method_guard(request: Request, call_next):
+    # GET/HEAD always OK (subject to auth + gate).
+    # POST only for the oven control endpoint; everything else is blocked.
+    path = request.url.path.rstrip("/") or "/"
+    if request.method in ("GET", "HEAD"):
+        pass
+    elif request.method == "POST" and path == "/v1/oven":
+        pass
+    else:
         notify_write_attempt(request)
-        return JSONResponse({"detail": "Read-only API"}, status_code=405, headers={"Allow": "GET, HEAD"})
+        return JSONResponse(
+            {"detail": "Method not allowed (writes limited to POST /v1/oven)"},
+            status_code=405,
+            headers={"Allow": "GET, HEAD, POST"},
+        )
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -538,6 +599,68 @@ async def get_history(
     return data[0] if data else []
 
 
+@app.post("/v1/oven", dependencies=[Depends(require_access)])
+async def control_oven(request: Request):
+    """
+    Control the regular oven only.
+
+    Body (JSON) — one of:
+
+      Power:
+        {"entity_id": "switch.oven_power", "service": "turn_on"}
+        {"entity_id": "switch.oven_power", "service": "turn_off"}
+        {"entity_id": "switch.oven_power", "service": "toggle"}
+
+      Child lock:
+        {"entity_id": "switch.oven_child_lock", "service": "turn_on"}
+        {"entity_id": "switch.oven_child_lock", "service": "turn_off"}
+
+      Programme (selected = queue, active = start immediately when remote start allows):
+        {"entity_id": "select.oven_selected_programme", "service": "select_option",
+         "option": "cooking_oven_program_heating_mode_hot_air"}
+        {"entity_id": "select.oven_active_programme", "service": "select_option",
+         "option": "cooking_oven_program_heating_mode_hot_air"}
+
+      Alarm clock (seconds):
+        {"entity_id": "number.oven_alarm_clock", "service": "set_value", "value": 300}
+
+    Only the five oven entity_ids listed in OVEN_WRITE_ENTITIES are accepted.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+
+    entity_id = str(body.get("entity_id", "")).strip()
+    service = str(body.get("service", "")).strip()
+    if entity_id not in OVEN_WRITE_ENTITIES:
+        raise HTTPException(400, f"entity_id not allowed for write (oven only): {entity_id or '(missing)'}")
+    domain = entity_id.split(".", 1)[0]
+    allowed_services = OVEN_WRITE_SERVICES.get(domain, frozenset())
+    if service not in allowed_services:
+        raise HTTPException(400, f"service '{service}' not allowed for {domain}")
+
+    # Build the payload Home Assistant expects for the service.
+    payload: dict = {"entity_id": entity_id}
+    if domain == "select":
+        option = body.get("option")
+        if not isinstance(option, str) or not option.strip():
+            raise HTTPException(400, "select requires string 'option'")
+        payload["option"] = option.strip()
+    elif domain == "number":
+        if "value" not in body:
+            raise HTTPException(400, "number requires 'value'")
+        try:
+            payload["value"] = float(body["value"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "'value' must be a number")
+
+    log.info("Oven write: %s.%s entity_id=%s", domain, service, entity_id)
+    return await ha_post(f"/api/services/{domain}/{service}", payload)
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -569,7 +692,7 @@ def serve(config_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HaFunnel: read-only HTTPS API for Home Assistant")
+    parser = argparse.ArgumentParser(description="HaFunnel: token-protected HTTPS API for Home Assistant (writes limited to oven)")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("gen-token", help="generate a client token and its hash")
     p_serve = sub.add_parser("serve", help="run the server (default)")
